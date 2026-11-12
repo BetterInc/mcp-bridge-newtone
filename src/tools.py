@@ -1,0 +1,504 @@
+# --- Live Newtone tools -------------------------------------------------------------------------
+# Newtone is a native Fruity effect (TTestPlug in Newtone_x64.dll) that hosts Image-Line's zplane
+# engine (Newtone_Engine_x64.dll, VST2/JUCE). BetterFL Bridge's native module reaches it on a mixer
+# slot (better-fl-mcp docs/re-newtone.md, bridge/src/newtone.cpp):
+#   newtone_state_get / newtone_state_set   SaveRestoreState (the blob NewtoneState decodes)
+#   newtone_load_file                       Dispatcher(FPD_LoadFile): like dropping a file on Newtone
+#   newtone_engine(track, slot, xml)        the engine's XML command channel (effSetChunk/effGetChunk);
+#                                           no command = the current <NewToneProject> XML
+# Correction is done in the project XML (per note fCurrentPitchOffset, fDrift, ...) and sent back
+# as a whole <NewToneProject>; rendering is the engine's <saveAudioFile/>.
+import base64
+import os
+import re
+import sys
+
+import mixer
+import plugins
+
+api = None
+
+_NATIVE = ("newtone_state_get", "newtone_state_set", "newtone_load_file", "newtone_engine")
+_AUDIO = (".wav", ".aif", ".aiff", ".snd", ".mp3", ".rx2", ".rex", ".rcy", ".ogg", ".flac", ".m4a")
+_PLUGIN = "Newtone"
+_ANALYSIS_WAIT = 25.0  # s a load waits for the analysis (the bridge's step limit is ~30 s)
+_APPLY_WAIT = 10.0     # s an edit waits until the engine shows it
+
+
+def _nat():
+    n = api.native
+    missing = [f for f in _NATIVE if not hasattr(n, f)]
+    if missing:
+        raise RuntimeError("the running BetterFL Bridge has no Newtone support (missing native "
+                           f"{', '.join(missing)}): restart FL Studio to load BetterFL Bridge 0.1.0 built "
+                           "2026-11-12 or later (the build with Newtone support)")
+    return n
+
+
+def _now():
+    try:
+        import time
+        return time.monotonic()
+    except Exception:  # no time module in this interpreter: count steps instead
+        _now.ticks = getattr(_now, "ticks", 0) + 1
+        return _now.ticks * 0.05
+
+
+def _core(name, args):
+    """Run a core BetterFL tool (fl_mixer_add_effect, fl_load_sample, fl_playlist_add)."""
+    if hasattr(api, "call_tool"):
+        return api.call_tool(name, args)
+    bridge = sys.modules.get("betterfl_bridge")  # bridges before ExtensionAPI.call_tool
+    if bridge is None or name not in getattr(bridge, "TOOLS", {}):
+        raise RuntimeError(f"this BetterFL Bridge cannot run {name} for an extension; update BetterFL")
+    return bridge.TOOLS[name][0](dict(args))
+
+
+def _check_slot(track, slot):
+    if not 0 <= track < mixer.trackCount() or not 0 <= slot <= 9:
+        raise ValueError(f"mixer track 0..{mixer.trackCount() - 1}, slot 0..9")
+
+
+def _target(args):
+    """(track, slot) of the Newtone to work on: track + slot, track alone (its first Newtone), or the
+    last Newtone in the mixer."""
+    if args.get("track") is not None:
+        track = int(args["track"])
+        if args.get("slot") is not None:
+            slot = int(args["slot"])
+        else:
+            if not 0 <= track < mixer.trackCount():
+                raise ValueError(f"mixer track 0..{mixer.trackCount() - 1}")
+            slots = [s for s in range(10) if plugins.isValid(track, s) and plugins.getPluginName(track, s) == _PLUGIN]
+            if not slots:
+                raise RuntimeError(f"mixer track {track} has no Newtone; load one with fl_newtone_load")
+            slot = slots[0]
+    else:
+        found = [f for f in api.find_plugins([_PLUGIN]) if f[1] >= 0]
+        if not found:
+            raise RuntimeError("no Newtone in the mixer; load one with fl_newtone_load")
+        track, slot = found[-1][0], found[-1][1]
+    _check_slot(track, slot)
+    return track, slot
+
+
+def _project(track, slot):
+    """Current <NewToneProject> XML of the engine."""
+    return _nat().newtone_engine(track, slot).decode("utf-8", "replace")
+
+
+def _command(track, slot, xml):
+    """Send one engine command; (done, reply XML)."""
+    reply = _nat().newtone_engine(track, slot, xml).decode("utf-8", "replace")
+    return 'done="1"' in reply, reply
+
+
+def _send_project(track, slot, xml):
+    if "<NewToneProject" not in xml:
+        raise ValueError("not a <NewToneProject> document")
+    _nat().newtone_engine(track, slot, xml[xml.index("<NewToneProject"):])  # the bridge adds <?xml ...?>
+
+
+def _esc(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _abs_file(path, exts, what):
+    path = str(path or "")
+    if not path or not os.path.isabs(path):
+        raise ValueError(f"{what}: give an absolute path")
+    if not path.lower().endswith(exts):
+        raise ValueError(f"{what}: must be one of {', '.join(exts)}")
+    return os.path.normpath(path)
+
+
+# --- notes ------------------------------------------------------------------------------------
+_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+_RATES = {}
+
+
+def _pitch_name(p):
+    n = int(round(p))
+    return f"{_NAMES[n % 12]}{n // 12 - 1}{int(round((p - n) * 100)):+d}c"
+
+
+def _parse_pitch(v):
+    """MIDI number (60 = C4, fractions allowed) or a name like 'A4', 'C#3', 'Eb5' (+/-cents: 'A4+20c')."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    m = re.fullmatch(r"([A-Ga-g])([#b]?)(-?\d+)(?:([+-]\d+(?:\.\d+)?)c)?", str(v).strip())
+    if not m:
+        raise ValueError(f"pitch {v!r}: give a MIDI number or a note name like 'A4' or 'C#3'")
+    pc = NOTE_NAMES[(m.group(1) + m.group(2)).lower()]
+    return 12 * (int(m.group(3)) + 1) + pc + (float(m.group(4)) / 100 if m.group(4) else 0.0)
+
+
+def _rate(xml):
+    """Sample rate of the analysed audio (note positions are in its samples), or None."""
+    path = (element_attrs(xml, "Trk_0") or {}).get("FilePath")
+    if not path:
+        return None
+    if path not in _RATES:
+        try:
+            _RATES[path] = int(api.native.wav_info(path)[1])
+        except Exception:
+            _RATES[path] = None
+    return _RATES[path]
+
+
+def _voiced(n):
+    try:
+        return float(n.get("fOrigVelocity", 0) or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _note_view(n, rate):
+    orig = float(n.get("fOrigPitch", 0))
+    shift = float(n.get("fCurrentPitchOffset", 0)) + float(n.get("fAdditionalPitchOffset", 0))
+    start, length = int(n.get("iCurStartSamplePos", 0)), int(n.get("iCurLength", 0))
+    out = {"index": n["index"], "start": start, "length": length}
+    if rate:
+        out.update(start_s=round(start / rate, 3), end_s=round((start + length) / rate, 3))
+    out.update(detected=round(orig, 3), detected_name=_pitch_name(orig), shift=round(shift, 3),
+               pitch=round(orig + shift, 3), pitch_name=_pitch_name(orig + shift),
+               drift=n.get("fDrift"), volume=n.get("fCurVolume"), formant=n.get("fCurFormantFactor"),
+               vibrato={"freq": n.get("fVibFreq"), "start": n.get("fVibAmpStart"), "end": n.get("fVibAmpEnd")},
+               transition={"in": n.get("fPitchSmoothInTime"), "out": n.get("fPitchSmoothOutTime")})
+    if not _voiced(n):
+        out["silence"] = True
+    return out
+
+
+def _track_notes(xml):
+    return [n for n in project_notes(xml) if n["track"] == "Trk_0"]
+
+
+def _summary(xml):
+    notes = _track_notes(xml)
+    voiced = [n for n in notes if _voiced(n)]
+    out = {"notes": len(voiced), "elements": len(notes), "audio": (element_attrs(xml, "Trk_0") or {}).get("FilePath")}
+    if voiced:
+        out["range"] = [_pitch_name(min(float(n["fOrigPitch"]) for n in voiced)),
+                        _pitch_name(max(float(n["fOrigPitch"]) for n in voiced))]
+    return out
+
+
+# --- applying an edited project ---------------------------------------------------------------
+def _matches(xml, expected):
+    have = {n["index"]: n for n in _track_notes(xml)}
+    for i, attrs in expected.items():
+        n = have.get(i)
+        if n is None:
+            return False
+        for k, v in attrs.items():
+            try:
+                if abs(float(n.get(k)) - v) > 1e-4 * max(1.0, abs(v)):
+                    return False
+            except (TypeError, ValueError):
+                return False
+    return True
+
+
+def _apply_step(args, key, build):
+    """Stepped: build(xml) -> (new_xml, {index: {attr: value}}, extra result); send the new project to
+    the engine, then wait until the engine shows the edited values (stable for 0.5 s)."""
+    track, slot = _target(args)
+    if not args.get("_continue"):
+        old = _project(track, slot)
+        if "<NewToneProject" not in old or not _track_notes(old):
+            raise RuntimeError("Newtone has no analysed audio yet; load some with fl_newtone_load")
+        new, edits, extra = build(old)
+        if not edits:
+            return dict(extra, done=True, track=track, slot=slot, changed=0)
+        _send_project(track, slot, new)
+        api.step[key] = {"t0": _now(), "seen": None, "extra": extra, "changed": len(edits),
+                         "expected": {i: {k: float(v) for k, v in a.items()} for i, a in edits.items()}}
+    job = api.step[key]
+    now = _now()
+    if _matches(_project(track, slot), job["expected"]):
+        if job["seen"] is None:
+            job["seen"] = now
+        if now - job["seen"] >= 0.5:
+            return dict(job["extra"], done=True, track=track, slot=slot, changed=job["changed"], confirmed=True)
+    else:
+        job["seen"] = None
+    if now - job["t0"] > _APPLY_WAIT:
+        return dict(job["extra"], done=True, track=track, slot=slot, changed=job["changed"], confirmed=False,
+                    warning="Newtone did not show the edit yet; check with fl_newtone_notes")
+    return {"done": False}
+
+
+# --- tools ------------------------------------------------------------------------------------
+def _try_project(track, slot):
+    try:
+        return _project(track, slot)
+    except RuntimeError:  # engine not ready yet right after adding Newtone
+        return ""
+
+
+def _identity(xml):
+    """(audio file, audio object UUID) of the loaded take; a new load changes the UUID."""
+    return [(element_attrs(xml, "Trk_0") or {}).get("FilePath"), (element_attrs(xml, "AudioObject") or {}).get("UUID")]
+
+
+def cmd_load(args):
+    """Stepped: (add Newtone to a mixer slot and) load an audio file, then wait for the analysis."""
+    n = _nat()
+    if not args.get("_continue"):
+        path = _abs_file(args.get("path"), _AUDIO, "path")
+        track = int(args["track"])
+        if not 0 <= track < mixer.trackCount():
+            raise ValueError(f"mixer track 0..{mixer.trackCount() - 1}")
+        if args.get("slot") is not None:
+            slot = int(args["slot"])
+        else:
+            free = [s for s in range(10) if not plugins.isValid(track, s)]
+            if not free:
+                raise RuntimeError(f"mixer track {track} has no free slot")
+            slot = free[0]
+        _check_slot(track, slot)
+        added = False
+        if plugins.isValid(track, slot):
+            if plugins.getPluginName(track, slot) != _PLUGIN:
+                raise RuntimeError(f"mixer track {track} slot {slot} holds {plugins.getPluginName(track, slot)}, "
+                                   "not Newtone; pick an empty slot or a Newtone")
+        else:
+            _core("fl_mixer_add_effect", {"track": track, "slot": slot, "plugin": _PLUGIN})
+            added = True
+        before = _identity(_try_project(track, slot))
+        result = n.newtone_load_file(track, slot, path)
+        api.step["nt_load"] = {"track": track, "slot": slot, "path": path, "added": added, "result": result,
+                               "before": before, "t0": _now(),
+                               "count": -1, "since": 0.0}
+    job = api.step["nt_load"]
+    track, slot, now = job["track"], job["slot"], _now()
+    xml = _try_project(track, slot)
+    if not job.get("engine_sent") and now - job["t0"] > 3.0 and _identity(xml) == job["before"]:
+        # Newtone's FPD_LoadFile did not take the file (seen live in FL 2026.1.6): load it through the
+        # engine's own command channel instead (same command Newtone's Delphi side sends).
+        path_xml = job["path"].replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
+        job["engine_sent"] = True
+        job["engine_reply"] = _nat().newtone_engine(track, slot, f'<loadAudioFile AudioPath="{path_xml}"/>')
+        job["t0"] = now
+        return {"done": False}
+    count = len(_track_notes(xml))
+    ident = _identity(xml)
+    fresh = ident[0] is not None and ident != job["before"]
+    if fresh and count > 0 and count == job["count"]:
+        if now - job["since"] >= 1.5:
+            return dict(_summary(xml), done=True, track=track, slot=slot, added=job["added"], source=job["path"])
+    else:
+        job["count"], job["since"] = count, now
+    if now - job["t0"] > _ANALYSIS_WAIT:
+        return dict(_summary(xml), done=True, track=track, slot=slot, added=job["added"], source=job["path"],
+                    analysing=True, dispatcher=job["result"],
+                    warning="Newtone is still analysing (or did not take the file); check fl_newtone_notes")
+    return {"done": False}
+
+
+def cmd_notes(args):
+    track, slot = _target(args)
+    xml = _project(track, slot)
+    rate = _rate(xml)
+    notes = _track_notes(xml)
+    if not args.get("include_silent"):
+        notes = [n for n in notes if _voiced(n)]
+    notes = notes[:int(args.get("limit", 200))]
+    rows = notes if args.get("raw") else [_note_view(n, rate) for n in notes]
+    return dict(_summary(xml), track=track, slot=slot, sample_rate=rate, shown=len(rows), notes=rows)
+
+
+def cmd_correct(args):
+    scale = str(args.get("scale") or "chromatic")
+    try:
+        scale_pitches(scale)
+    except (KeyError, IndexError):
+        raise ValueError(f"scale {scale!r}: '<root> <kind>' with kind one of {sorted(SCALES)}, or 'chromatic'")
+    amount = min(1.0, max(0.0, float(args.get("amount", 1.0))))
+    variation = args.get("variation")
+    variation = None if variation is None else min(1.0, max(0.0, float(variation)))
+    only = None if args.get("notes") is None else {int(i) for i in args["notes"]}
+
+    def build(old):
+        new = correct_xml(old, scale, amount, variation, only)
+        edits, moved = {}, []
+        for n in _track_notes(new):
+            if _voiced(n) and (only is None or n["index"] in only):
+                edits[n["index"]] = {k: n[k] for k in ("fCurrentPitchOffset", "fDrift") if k in n}
+                v = _note_view(n, None)
+                moved.append({k: v[k] for k in ("index", "detected_name", "pitch_name", "shift")})
+        return new, edits, {"scale": scale, "amount": amount, "variation": variation, "notes": moved[:100]}
+    return _apply_step(args, "nt_correct", build)
+
+
+_EDIT_FIELDS = "index, pitch (MIDI number or name like 'A4'), shift (semitones from the detected pitch), " \
+               "drift (0 flat .. 1 natural), volume (gain, 1 = unchanged), formant (factor, 1 = unchanged), " \
+               "vibrato {freq Hz, start, end semitones}, transition {in, out samples}"
+
+
+def cmd_edit(args):
+    changes = args.get("notes") or []
+    if not isinstance(changes, list) or not changes:
+        raise ValueError("notes: a list of {" + _EDIT_FIELDS + "}")
+
+    def build(old):
+        by_index = {n["index"]: n for n in _track_notes(old)}
+        edits = {}
+        for c in changes:
+            i = int(c["index"])
+            if i not in by_index:
+                raise KeyError(f"no note {i} (see fl_newtone_notes)")
+            orig = float(by_index[i]["fOrigPitch"])
+            add = float(by_index[i].get("fAdditionalPitchOffset", 0))
+            e = edits.setdefault(i, {})
+            if c.get("pitch") is not None and c.get("shift") is not None:
+                raise ValueError(f"note {i}: give pitch or shift, not both")
+            if c.get("pitch") is not None:
+                target = _parse_pitch(c["pitch"])
+                e.update(fCurPitch=target, fCurrentPitchOffset=target - orig - add)
+            if c.get("shift") is not None:
+                shift = float(c["shift"])
+                e.update(fCurPitch=orig + shift, fCurrentPitchOffset=shift - add)
+            if c.get("drift") is not None:
+                e["fDrift"] = min(1.0, max(0.0, float(c["drift"])))
+            if c.get("volume") is not None:
+                e["fCurVolume"] = max(0.0, float(c["volume"]))
+            if c.get("formant") is not None:
+                e["fCurFormantFactor"] = float(c["formant"])
+            vib = c.get("vibrato")
+            if vib is not None:
+                vib = vib if isinstance(vib, dict) else {"freq": 5.0, "start": float(vib), "end": float(vib)}
+                for k, attr in (("freq", "fVibFreq"), ("start", "fVibAmpStart"), ("end", "fVibAmpEnd")):
+                    if vib.get(k) is not None:
+                        e[attr] = float(vib[k])
+            tr = c.get("transition")
+            if isinstance(tr, dict):
+                for k, attr in (("in", "fPitchSmoothInTime"), ("out", "fPitchSmoothOutTime")):
+                    if tr.get(k) is not None:
+                        e[attr] = max(0.0, float(tr[k]))
+            if not e:
+                raise ValueError(f"note {i}: nothing to change; fields: {_EDIT_FIELDS}")
+        return set_note_attrs(old, edits, "Trk_0"), edits, {}
+    return _apply_step(args, "nt_edit", build)
+
+
+def cmd_render(args):
+    track, slot = _target(args)
+    n = _nat()
+    path = _abs_file(args.get("path"), (".wav",), "path")
+    try:
+        n.wav_info(path)
+        exists = True
+    except Exception:
+        exists = False
+    if exists and not args.get("overwrite"):
+        raise FileExistsError(f"{path} exists; pass overwrite=true")
+    xml = '<saveAudioFile AudioPath="%s"' % _esc(path)
+    if args.get("start") is not None or args.get("end") is not None:
+        if args.get("start") is None or args.get("end") is None:
+            raise ValueError("give both start and end (seconds), or neither")
+        xml += ' startPos="%r" endPos="%r"' % (float(args["start"]), float(args["end"]))
+    done, reply = _command(track, slot, xml + "/>")
+    try:
+        frames, rate = n.wav_info(path)[:2]
+    except Exception as e:
+        raise RuntimeError(f"Newtone did not write {path} (reply {reply!r}): {e}")
+    out = {"track": track, "slot": slot, "path": path, "seconds": round(frames / float(rate), 3),
+           "sample_rate": rate, "engine_done": done}
+    pl = args.get("then_playlist")
+    if pl:
+        pl = pl if isinstance(pl, dict) else {}
+        load = {"sample": path, "name": pl.get("name") or os.path.splitext(os.path.basename(path))[0]}
+        if pl.get("mixer_track") is not None:
+            load["mixer_track"] = int(pl["mixer_track"])
+        ch = _core("fl_load_sample", load)
+        clip = _core("fl_playlist_add", {"channel": ch["channel"], "sample": path,
+                                         "bar": float(pl.get("bar", 1)), "beat": float(pl.get("beat", 0)),
+                                         "track": int(pl.get("track", 1))})
+        out["playlist"] = {"channel": ch["channel"], "name": ch.get("name"), "clip": clip}
+    return out
+
+
+_SIMPLE = {"selectAll", "deselectAll", "quantizeTime", "undo", "redo", "copy", "cut", "paste", "delete",
+           "cutAtCursor", "loopSelected"}
+
+
+def cmd_command(args):
+    track, slot = _target(args)
+    name = str(args["command"])
+    if name in _SIMPLE:
+        xml = f"<{name}/>"
+    elif name == "saveMidiFile":
+        xml = f'<saveMidiFile AudioPath="{_esc(_abs_file(args.get("path"), (".mid",), "path"))}"/>'
+    else:
+        raise ValueError(f"command must be one of {sorted(_SIMPLE | {'saveMidiFile'})}")
+    done, reply = _command(track, slot, xml)
+    return {"track": track, "slot": slot, "sent": xml, "done": done, "reply": reply}
+
+
+def cmd_project(args):
+    track, slot = _target(args)
+    if args.get("xml"):
+        _send_project(track, slot, str(args["xml"]))
+    return {"track": track, "slot": slot, "xml": _project(track, slot)}
+
+
+def cmd_state(args):
+    track, slot = _target(args)
+    blob = _nat().newtone_state_get(track, slot)
+    st = NewtoneState(blob)
+    out = {"track": track, "slot": slot, "bytes": len(blob), "roundtrip": st.encode() == blob,
+           "tags": [[t, len(d)] for t, d in st.sections], "sample": st.sample_path, "editor": st.editor(),
+           "engine_params": st.engine_params(), "notes": len(st.notes())}
+    if args.get("raw"):
+        out["blob_b64"] = base64.b64encode(blob).decode()
+    return out
+
+
+def cmd_state_set(args):
+    track, slot = _target(args)
+    blob = base64.b64decode(args["blob_b64"])
+    NewtoneState(blob)  # validate before FL sees it
+    _nat().newtone_state_set(track, slot, blob)
+    return {"track": track, "slot": slot, "loaded": len(blob)}
+
+
+def register(core):
+    global api
+    api = core
+    loc = {"track": {"type": "integer", "description": "mixer track of the Newtone (default: the last one)"},
+           "slot": {"type": "integer", "description": "mixer slot 0..9 (default: the track's first Newtone)"}}
+    api.tool("fl_newtone_load", cmd_load,
+             "Load an audio file into Newtone on a mixer track (adds Newtone to the given or first free slot, or "
+             "reuses the Newtone there) and wait for its note analysis; returns track/slot and a notes summary.",
+             dict(loc, path={"type": "string", "description": "absolute path of a .wav/.aif/.mp3/.flac/.ogg/..."}),
+             ["path", "track"], stepped=True)
+    api.tool("fl_newtone_notes", cmd_notes,
+             "List Newtone's notes: index, start/end (samples and s), detected and current pitch (MIDI + name "
+             "+ cents), shift, drift, volume, formant, vibrato, transition.",
+             dict(loc, limit={"type": "integer"}, include_silent={"type": "boolean"}, raw={"type": "boolean"}), [])
+    api.tool("fl_newtone_correct", cmd_correct,
+             "Pitch-correct notes to a scale like Newtone's correct pitch: scale ('D minor', 'F# major', "
+             "'chromatic'; kinds: major, minor, harmonic minor, dorian, pentatonic, minor pentatonic), amount "
+             "0..1 (center), variation 0..1 (drift kept; 0 = flat), notes = optional note indexes.",
+             dict(loc, scale={"type": "string"}, amount={"type": "number"}, variation={"type": "number"},
+                  notes={"type": "array", "items": {"type": "integer"}}), ["scale"], stepped=True)
+    api.tool("fl_newtone_edit", cmd_edit, "Edit single notes: notes = [{" + _EDIT_FIELDS + "}].",
+             dict(loc, notes={"type": "array", "items": {"type": "object"}}), ["notes"], stepped=True)
+    api.tool("fl_newtone_render", cmd_render,
+             "Render Newtone's edited audio to a WAV (engine saveAudioFile; start/end in seconds optional); "
+             "then_playlist = {bar, beat, track, name, mixer_track} also loads it as an audio clip and places it.",
+             dict(loc, path={"type": "string", "description": "absolute .wav path"}, overwrite={"type": "boolean"},
+                  start={"type": "number"}, end={"type": "number"}, then_playlist={"type": "object"}), ["path"])
+    api.tool("fl_newtone_command", cmd_command,
+             "Run a Newtone engine command: undo, redo, selectAll, deselectAll, quantizeTime, copy, cut, paste, "
+             "delete, cutAtCursor, loopSelected, saveMidiFile (path .mid).",
+             dict(loc, command={"type": "string"}, path={"type": "string"}), ["command"])
+    api.tool("fl_newtone_project", cmd_project,
+             "Read (or with xml: replace) Newtone's engine project XML (<NewToneProject>: every note and its "
+             "correction); use it to back up and restore around edits.", dict(loc, xml={"type": "string"}), [])
+    api.tool("fl_newtone_state", cmd_state, "Debug: decode Newtone's saved state (raw: base64 blob).",
+             dict(loc, raw={"type": "boolean"}), [])
+    api.tool("fl_newtone_state_set", cmd_state_set, "Debug: load a Newtone state blob (base64).",
+             dict(loc, blob_b64={"type": "string"}), ["blob_b64"])

@@ -1,0 +1,9 @@
+{
+  "id": "mcp-bridge-newtone",
+  "name": "MCP Bridge Newtone",
+  "version": "0.1.0",
+  "description": "Control Image-Line Newtone from BetterFL MCP Bridge: load audio into Newtone on a mixer track, read the detected notes, pitch-correct to a scale, edit single notes, render the result and place it in the playlist. Needs BetterFL Bridge with Newtone support.",
+  "api_version": 1,
+  "plugins": ["Newtone"],
+  "license": "free"
+}
