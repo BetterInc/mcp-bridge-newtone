@@ -412,9 +412,14 @@ def _command(track, slot, xml):
     return 'done="1"' in reply, reply
 
 
+_MAX_XML = 64 << 20  # bytes of project XML sent to the engine
+
+
 def _send_project(track, slot, xml):
-    if "<NewToneProject" not in xml:
+    if not isinstance(xml, str) or "<NewToneProject" not in xml:
         raise ValueError("not a <NewToneProject> document")
+    if len(xml.encode("utf-8")) > _MAX_XML or "\x00" in xml:
+        raise ValueError("project XML too large or contains NUL")
     _nat().newtone_engine(track, slot, xml[xml.index("<NewToneProject"):])  # the bridge adds <?xml ...?>
 
 
@@ -777,7 +782,12 @@ def cmd_state(args):
 
 def cmd_state_set(args):
     track, slot = _target(args)
-    blob = base64.b64decode(args["blob_b64"])
+    try:
+        blob = base64.b64decode(str(args.get("blob_b64") or ""), validate=True)
+    except ValueError as e:
+        raise ValueError(f"blob_b64 is not valid base64: {e}") from None
+    if not blob:
+        raise ValueError("blob_b64 is empty")
     NewtoneState(blob)  # validate before FL sees it
     _nat().newtone_state_set(track, slot, blob)
     return {"track": track, "slot": slot, "loaded": len(blob)}
